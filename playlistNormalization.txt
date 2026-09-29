@@ -1,0 +1,93 @@
+const PLAYLIST_URI = "spotify:playlist:19PgP2QSGPcm6Ve8VhbtpG";
+
+function spotifyImageToHttps(uri) {
+    const prefix = "spotify:image:";
+
+    if (!uri) return null;
+
+    return uri.startsWith(prefix)
+        ? `https://i.scdn.co/image/${uri.slice(prefix.length)}`
+        : uri;
+}
+
+function getAlbumImage(album) {
+    const images = album?.images ?? [];
+
+    // Prefer Spotify's large artwork when available.
+    return (
+        images.find(image => image?.label === "large") ??
+        images.find(image => image?.label === "xlarge") ??
+        images.find(image => image?.label === "standard") ??
+        images[0] ??
+        null
+    );
+}
+
+function normalizePlaylist(playlist) {
+    const tracks = (playlist?.contents?.items ?? [])
+        .filter(item =>
+            item?.type === "track" &&
+            item?.uri &&
+            !item?.isLocal &&
+            item?.isPlayable !== false
+        )
+        .map((item, index) => {
+            const albumImage = getAlbumImage(item.album);
+
+            return {
+                playlistPosition: index + 1,
+
+                spotifyUri: item.uri,
+                trackName: item.name ?? null,
+
+                artists: (item.artists ?? []).map(artist => ({
+                    spotifyUri: artist.uri ?? null,
+                    name: artist.name ?? null
+                })),
+
+                album: {
+                    spotifyUri: item.album?.uri ?? null,
+                    name: item.album?.name ?? null,
+
+                    imageUri: albumImage?.url ?? null,
+                    imageUrl: spotifyImageToHttps(albumImage?.url)
+                },
+
+                discNumber: item.discNumber ?? null,
+                trackNumber: item.trackNumber ?? null,
+                durationMs: item.duration?.milliseconds ?? null,
+                explicit: item.isExplicit === true
+            };
+        });
+
+    return {
+        schemaVersion: 1,
+
+        source: {
+            type: "spotify_playlist",
+            playlistUri: playlist?.metadata?.uri ?? PLAYLIST_URI,
+            playlistName: playlist?.metadata?.name ?? null,
+            description: playlist?.metadata?.description ?? null
+        },
+
+        extractedAt: new Date().toISOString(),
+
+        trackCount: tracks.length,
+
+        tracks
+    };
+}
+
+async function extractPlaylist() {
+    const playlist =
+        await Spicetify.Platform.PlaylistAPI.getPlaylist(PLAYLIST_URI);
+
+    const normalized = normalizePlaylist(playlist);
+
+    console.log(normalized);
+    console.log(JSON.stringify(normalized, null, 2));
+
+    return normalized;
+}
+
+const triviaSource = await extractPlaylist();
