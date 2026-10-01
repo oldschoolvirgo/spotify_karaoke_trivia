@@ -2514,6 +2514,345 @@ ${JSON.stringify(generationRequest.source)}`;
 
 
     // ============================================================
+    // RECOVERY / REBUILD
+    // ============================================================
+
+    function requireWorkingSource() {
+        if (!state.workingSource) {
+            throw new Error(
+                "No working source is loaded. Run TriviaAdmin.importPlaylist() first."
+            );
+        }
+
+        return state.workingSource;
+    }
+
+
+    function rebuildSchema() {
+        const source =
+            requireWorkingSource();
+
+        const schema =
+            buildTriviaV2(
+                source
+            );
+
+        state.schema =
+            schema;
+
+        const validation =
+            validateTriviaV2(
+                schema
+            );
+
+        console.log(
+            "Schema rebuilt from working source."
+        );
+
+        console.log(
+            "Schema stats:",
+            schema.stats
+        );
+
+        console.log(
+            "Validation:",
+            validation
+        );
+
+        return schema;
+    }
+
+
+    async function retryErrors(
+        options = {}
+    ) {
+        const source =
+            requireWorkingSource();
+
+        const config = {
+            ...DEFAULT_CONFIG,
+            ...options
+        };
+
+        const recordings =
+            Object.values(
+                source.recordings ?? {}
+            );
+
+        const artists =
+            Object.values(
+                source.artists ?? {}
+            );
+
+        const lyricsErrors =
+            recordings.filter(
+                recording =>
+                    recording.lyricsStatus ===
+                    "error"
+            );
+
+        const artistErrors =
+            artists.filter(
+                artist =>
+                    artist.artistOverviewStatus ===
+                    "error"
+            );
+
+        console.log(
+            "========================================"
+        );
+
+        console.log(
+            "TriviaAdmin — Retry Errors"
+        );
+
+        console.log(
+            "========================================"
+        );
+
+        console.log(
+            `Lyrics errors to retry: ${lyricsErrors.length}`
+        );
+
+        console.log(
+            `Artist biography errors to retry: ${artistErrors.length}`
+        );
+
+
+        // --------------------------------------------------------
+        // Lyrics
+        // --------------------------------------------------------
+
+        for (
+            let index = 0;
+            index < lyricsErrors.length;
+            index++
+        ) {
+            const recording =
+                lyricsErrors[index];
+
+            console.log(
+                `[${index + 1}/${lyricsErrors.length}] Retrying lyrics: ${recording.trackName}`
+            );
+
+            try {
+                // Refresh metadata first because Spotify's current
+                // lyrics availability can change between imports.
+                const rawMetadata =
+                    await getTrackMetadata(
+                        recording.spotifyUri
+                    );
+
+                const metadata =
+                    normalizeTrackMetadata(
+                        rawMetadata
+                    );
+
+                recording.metadata =
+                    metadata;
+
+                if (
+                    metadata?.hasLyrics !== true
+                ) {
+                    recording.lyrics =
+                        null;
+
+                    recording.lyricsStatus =
+                        "unavailable";
+
+                    delete recording.lyricsError;
+
+                    console.log(
+                        `○ ${recording.trackName} — Spotify now reports no lyrics`
+                    );
+                } else {
+                    const rawLyrics =
+                        await getTrackLyrics(
+                            recording.spotifyUri,
+                            recording.album?.imageUri
+                        );
+
+                    const normalizedLyrics =
+                        normalizeLyrics(
+                            rawLyrics
+                        );
+
+                    if (normalizedLyrics) {
+                        recording.lyrics =
+                            normalizedLyrics;
+
+                        recording.lyricsStatus =
+                            "available";
+
+                        delete recording.lyricsError;
+
+                        console.log(
+                            `✓ ${recording.trackName} — lyrics recovered`
+                        );
+                    } else {
+                        recording.lyrics =
+                            null;
+
+                        recording.lyricsStatus =
+                            "pending";
+
+                        recording.lyricsError = {
+                            message:
+                                "Spotify metadata reports lyrics, but the lyrics endpoint returned no usable lyrics."
+                        };
+
+                        console.warn(
+                            `◌ ${recording.trackName} — lyrics pending`
+                        );
+                    }
+                }
+            } catch (error) {
+                recording.lyrics =
+                    null;
+
+                recording.lyricsStatus =
+                    "error";
+
+                recording.lyricsError = {
+                    message:
+                        error?.message ||
+                        String(error) ||
+                        "Lyrics retry failed."
+                };
+
+                console.error(
+                    `✗ ${recording.trackName} — lyrics retry failed`,
+                    error
+                );
+            }
+
+            if (
+                config.lyricsDelayMs > 0 &&
+                index < lyricsErrors.length - 1
+            ) {
+                await sleep(
+                    config.lyricsDelayMs
+                );
+            }
+        }
+
+
+        // --------------------------------------------------------
+        // Artist biographies
+        // --------------------------------------------------------
+
+        for (
+            let index = 0;
+            index < artistErrors.length;
+            index++
+        ) {
+            const artist =
+                artistErrors[index];
+
+            console.log(
+                `[${index + 1}/${artistErrors.length}] Retrying artist: ${artist.name}`
+            );
+
+            try {
+                const response =
+                    await Spicetify.GraphQL.Request(
+                        Spicetify.GraphQL.Definitions
+                            .queryArtistOverview,
+                        {
+                            uri:
+                                artist.spotifyUri,
+
+                            locale: "",
+
+                            preReleaseV2:
+                                true
+                        }
+                    );
+
+                const normalized =
+                    normalizeArtistOverview(
+                        response
+                    );
+
+                if (
+                    normalized?.biography
+                ) {
+                    artist.artistOverview =
+                        normalized;
+
+                    artist.artistOverviewStatus =
+                        "available";
+
+                    delete artist.artistOverviewError;
+
+                    console.log(
+                        `✓ ${artist.name} — biography recovered`
+                    );
+                } else {
+                    artist.artistOverview =
+                        null;
+
+                    artist.artistOverviewStatus =
+                        "unavailable";
+
+                    delete artist.artistOverviewError;
+
+                    console.log(
+                        `○ ${artist.name} — biography unavailable`
+                    );
+                }
+            } catch (error) {
+                artist.artistOverviewStatus =
+                    "error";
+
+                artist.artistOverviewError = {
+                    message:
+                        error?.message ||
+                        String(error) ||
+                        "Artist biography retry failed."
+                };
+
+                console.error(
+                    `✗ ${artist.name} — biography retry failed`,
+                    error
+                );
+            }
+
+            if (
+                config.artistDelayMs > 0 &&
+                index < artistErrors.length - 1
+            ) {
+                await sleep(
+                    config.artistDelayMs
+                );
+            }
+        }
+
+
+        // --------------------------------------------------------
+        // Rebuild Schema V2
+        // --------------------------------------------------------
+
+        const schema =
+            rebuildSchema();
+
+        console.log(
+            "========================================"
+        );
+
+        console.log(
+            "Retry complete."
+        );
+
+        console.log(
+            "========================================"
+        );
+
+        return schema;
+    }
+
+
+    // ============================================================
     // PUBLIC API HELPERS
     // ============================================================
 
@@ -2785,6 +3124,10 @@ ${JSON.stringify(generationRequest.source)}`;
         state,
 
         importPlaylist,
+
+        retryErrors,
+
+        rebuildSchema,
 
         validate:
             validateCurrentSchema,
