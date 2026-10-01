@@ -3008,6 +3008,435 @@ ${JSON.stringify(generationRequest.source)}`;
     }
 
 
+    // ============================================================
+    // MILESTONE 7 — DETERMINISTIC CANDIDATE VALIDATION
+    // ============================================================
+
+    function candidateValidationError(
+        code,
+        message
+    ) {
+        return {
+            code,
+            message
+        };
+    }
+
+
+    function validateCandidate(
+        candidate,
+        generationSource = null
+    ) {
+        const source =
+            generationSource ??
+            buildGenerationInput(
+                candidate?.recordingKey
+            );
+
+        const recording =
+            source?.recording ??
+            null;
+
+        const artists =
+            source?.artists ??
+            [];
+
+        const errors = [];
+
+        const addError = (
+            code,
+            message
+        ) => {
+            errors.push(
+                candidateValidationError(
+                    code,
+                    message
+                )
+            );
+        };
+
+        if (
+            !candidate ||
+            typeof candidate !== "object" ||
+            Array.isArray(candidate)
+        ) {
+            addError(
+                "INVALID_CANDIDATE",
+                "Candidate must be an object."
+            );
+
+            return {
+                valid: false,
+                errors
+            };
+        }
+
+        if (
+            typeof candidate.recordingKey !== "string" ||
+            !candidate.recordingKey.trim()
+        ) {
+            addError(
+                "MISSING_RECORDING_KEY",
+                "recordingKey must be a non-empty string."
+            );
+        } else if (
+            recording?.recordingKey &&
+            candidate.recordingKey !== recording.recordingKey
+        ) {
+            addError(
+                "RECORDING_KEY_MISMATCH",
+                `Candidate recordingKey ${candidate.recordingKey} does not match source recordingKey ${recording.recordingKey}.`
+            );
+        }
+
+        if (
+            !QUESTION_TYPES.includes(
+                candidate.questionType
+            )
+        ) {
+            addError(
+                "INVALID_QUESTION_TYPE",
+                `Unsupported questionType: ${candidate.questionType}`
+            );
+        }
+
+        if (
+            typeof candidate.question !== "string" ||
+            !candidate.question.trim()
+        ) {
+            addError(
+                "INVALID_QUESTION",
+                "question must be a non-empty string."
+            );
+        }
+
+        if (
+            !Array.isArray(candidate.answers) ||
+            candidate.answers.length !== 4
+        ) {
+            addError(
+                "INVALID_ANSWERS",
+                "answers must contain exactly four choices."
+            );
+        } else {
+            const invalidAnswer =
+                candidate.answers.some(
+                    answer =>
+                        typeof answer !== "string" ||
+                        !answer.trim()
+                );
+
+            if (invalidAnswer) {
+                addError(
+                    "INVALID_ANSWER_VALUE",
+                    "Every answer choice must be a non-empty string."
+                );
+            }
+
+            const normalizedAnswers =
+                candidate.answers.map(
+                    answer =>
+                        typeof answer === "string"
+                            ? answer.trim().toLowerCase()
+                            : answer
+                );
+
+            if (
+                new Set(normalizedAnswers).size !==
+                normalizedAnswers.length
+            ) {
+                addError(
+                    "DUPLICATE_ANSWERS",
+                    "Answer choices must be unique."
+                );
+            }
+        }
+
+        if (
+            !Number.isInteger(
+                candidate.correctAnswer
+            ) ||
+            candidate.correctAnswer < 1 ||
+            candidate.correctAnswer > 4
+        ) {
+            addError(
+                "INVALID_CORRECT_ANSWER",
+                "correctAnswer must be an integer from 1 through 4."
+            );
+        }
+
+        if (
+            !QUESTION_DIFFICULTIES.includes(
+                candidate.difficulty
+            )
+        ) {
+            addError(
+                "INVALID_DIFFICULTY",
+                `Unsupported difficulty: ${candidate.difficulty}`
+            );
+        }
+
+        const sourceFact =
+            candidate.sourceFact;
+
+        if (
+            !sourceFact ||
+            typeof sourceFact !== "object" ||
+            Array.isArray(sourceFact)
+        ) {
+            addError(
+                "INVALID_SOURCE_FACT",
+                "sourceFact must be an object."
+            );
+        } else {
+            if (
+                !SOURCE_FACT_TYPES.includes(
+                    sourceFact.type
+                )
+            ) {
+                addError(
+                    "INVALID_SOURCE_FACT_TYPE",
+                    `Unsupported sourceFact.type: ${sourceFact.type}`
+                );
+            }
+
+            if (
+                typeof sourceFact.value !== "string" ||
+                !sourceFact.value.trim()
+            ) {
+                addError(
+                    "INVALID_SOURCE_FACT_VALUE",
+                    "sourceFact.value must be a non-empty string."
+                );
+            } else if (
+                SOURCE_FACT_TYPES.includes(
+                    sourceFact.type
+                )
+            ) {
+                const value =
+                    sourceFact.value.trim();
+
+                if (
+                    sourceFact.type === "lyric"
+                ) {
+                    const lines =
+                        recording?.lyrics?.lines ??
+                        [];
+
+                    const exactLine =
+                        lines.find(
+                            line =>
+                                line?.words === value &&
+                                line?.startTimeMs ===
+                                    sourceFact.startTimeMs
+                        );
+
+                    if (!exactLine) {
+                        addError(
+                            "UNGROUNDED_LYRIC",
+                            "sourceFact lyric and startTimeMs do not exactly match a lyric line in the source recording."
+                        );
+                    }
+                }
+
+                if (
+                    sourceFact.type === "recording_title" &&
+                    value !== recording?.title
+                ) {
+                    addError(
+                        "UNGROUNDED_RECORDING_TITLE",
+                        "sourceFact.value does not exactly match the source recording title."
+                    );
+                }
+
+                if (
+                    sourceFact.type === "recording_artist"
+                ) {
+                    const recordingArtists =
+                        recording?.artists ??
+                        [];
+
+                    const matchedArtist =
+                        recordingArtists.some(
+                            artist =>
+                                value === artist?.name ||
+                                value === artist?.spotifyUri
+                        );
+
+                    if (!matchedArtist) {
+                        addError(
+                            "UNGROUNDED_RECORDING_ARTIST",
+                            "sourceFact.value does not exactly match an artist name or URI on the source recording."
+                        );
+                    }
+                }
+
+                if (
+                    sourceFact.type === "artist_role"
+                ) {
+                    const artistRoles =
+                        recording?.metadata?.artistRoles ??
+                        [];
+
+                    const matchedRole =
+                        artistRoles.some(
+                            artistRole =>
+                                value === artistRole?.name ||
+                                value === artistRole?.role
+                        );
+
+                    if (!matchedRole) {
+                        addError(
+                            "UNGROUNDED_ARTIST_ROLE",
+                            "sourceFact.value does not exactly match an artist name or role in source metadata."
+                        );
+                    }
+                }
+
+                if (
+                    sourceFact.type === "artist_biography"
+                ) {
+                    if (
+                        typeof sourceFact.artistUri !== "string" ||
+                        !sourceFact.artistUri.trim()
+                    ) {
+                        addError(
+                            "MISSING_BIOGRAPHY_ARTIST_URI",
+                            "artist_biography source facts require sourceFact.artistUri."
+                        );
+                    } else {
+                        const artist =
+                            artists.find(
+                                item =>
+                                    item?.spotifyUri ===
+                                    sourceFact.artistUri
+                            );
+
+                        if (!artist) {
+                            addError(
+                                "UNKNOWN_BIOGRAPHY_ARTIST",
+                                `sourceFact.artistUri is not present in generation source: ${sourceFact.artistUri}`
+                            );
+                        } else if (
+                            typeof artist.biography !== "string" ||
+                            !artist.biography.includes(value)
+                        ) {
+                            addError(
+                                "UNGROUNDED_ARTIST_BIOGRAPHY",
+                                "sourceFact.value is not an exact substring of the supplied artist biography."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        const playback =
+            candidate.playback;
+
+        if (
+            !playback ||
+            typeof playback !== "object" ||
+            Array.isArray(playback)
+        ) {
+            addError(
+                "INVALID_PLAYBACK",
+                "playback must be an object."
+            );
+        } else {
+            const startMs =
+                playback.startMs;
+
+            if (
+                startMs !== null &&
+                (
+                    !Number.isFinite(startMs) ||
+                    startMs < 0
+                )
+            ) {
+                addError(
+                    "INVALID_PLAYBACK_START",
+                    "playback.startMs must be null or a non-negative number."
+                );
+            }
+
+            if (
+                Number.isFinite(startMs) &&
+                Number.isFinite(recording?.durationMs) &&
+                startMs >= recording.durationMs
+            ) {
+                addError(
+                    "PLAYBACK_START_OUT_OF_RANGE",
+                    "playback.startMs must be before the end of the source recording."
+                );
+            }
+
+            if (
+                !Number.isFinite(
+                    playback.durationMs
+                ) ||
+                playback.durationMs <= 0
+            ) {
+                addError(
+                    "INVALID_PLAYBACK_DURATION",
+                    "playback.durationMs must be a positive number."
+                );
+            }
+        }
+
+        return {
+            valid:
+                errors.length === 0,
+
+            errors
+        };
+    }
+
+
+    function validateCandidates(
+        candidates,
+        generationSource
+    ) {
+        if (!Array.isArray(candidates)) {
+            throw new Error(
+                "candidates must be an array."
+            );
+        }
+
+        const results =
+            candidates.map(
+                (candidate, index) => ({
+                    index,
+                    recordingKey:
+                        candidate?.recordingKey ??
+                        null,
+                    ...validateCandidate(
+                        candidate,
+                        generationSource
+                    )
+                })
+            );
+
+        const valid =
+            results.filter(
+                result =>
+                    result.valid
+            ).length;
+
+        return {
+            total:
+                results.length,
+
+            valid,
+
+            invalid:
+                results.length - valid,
+
+            results
+        };
+    }
+
+
     async function generateQuestions(
         recordingKey,
         {
@@ -3075,6 +3504,12 @@ ${JSON.stringify(generationRequest.source)}`;
                     )
             );
 
+        const validation =
+            validateCandidates(
+                candidates,
+                source
+            );
+
         const result = {
             recordingKey,
             source,
@@ -3092,7 +3527,9 @@ ${JSON.stringify(generationRequest.source)}`;
 
             rawCandidates,
 
-            candidates
+            candidates,
+
+            validation
         };
 
         state.lastGeneration =
@@ -3106,6 +3543,11 @@ ${JSON.stringify(generationRequest.source)}`;
             candidates
         );
 
+        console.log(
+            "Candidate validation:",
+            validation
+        );
+
         return result;
     }
 
@@ -3116,7 +3558,7 @@ ${JSON.stringify(generationRequest.source)}`;
 
     const api = {
         version:
-            "milestones-1-6",
+            "milestone-7-candidate-validation",
 
         config:
             DEFAULT_CONFIG,
@@ -3145,6 +3587,10 @@ ${JSON.stringify(generationRequest.source)}`;
         buildGenerationPrompt,
 
         generateQuestions,
+
+        validateCandidate,
+
+        validateCandidates,
 
         // Exposed primarily for debugging.
         helpers: {
