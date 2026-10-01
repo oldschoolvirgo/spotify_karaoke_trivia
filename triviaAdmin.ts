@@ -686,182 +686,217 @@ globalThis.TriviaAdmin = (() => {
 
 
     async function enrichAllRecordingLyrics(
-        source,
-        {
-            concurrency =
-                DEFAULT_CONFIG.lyricsConcurrency,
+    source,
+    {
+        concurrency =
+            DEFAULT_CONFIG.lyricsConcurrency,
 
-            delayMs =
-                DEFAULT_CONFIG.lyricsDelayMs
-        } = {}
-    ) {
-        const recordings =
-            Object.values(
-                source.recordings ?? {}
-            );
-
-        let nextIndex = 0;
-        let completed = 0;
-        let succeeded = 0;
-        let unavailable = 0;
-        let failed = 0;
-        let skipped = 0;
-
-        console.log(
-            `Starting lyrics enrichment for ${recordings.length} recordings...`
+        delayMs =
+            DEFAULT_CONFIG.lyricsDelayMs
+    } = {}
+) {
+    const recordings =
+        Object.values(
+            source.recordings ?? {}
         );
 
-        async function worker() {
-            while (true) {
-                const index =
-                    nextIndex++;
+    let nextIndex = 0;
+    let completed = 0;
+    let succeeded = 0;
+    let unavailable = 0;
+    let pending = 0;
+    let failed = 0;
+    let skipped = 0;
 
-                if (index >= recordings.length) {
-                    return;
-                }
+    console.log(
+        `Starting lyrics enrichment for ${recordings.length} recordings...`
+    );
 
-                const recording =
-                    recordings[index];
+    async function worker() {
+        while (true) {
+            const index =
+                nextIndex++;
 
-                // Resume support.
+            if (index >= recordings.length) {
+                return;
+            }
+
+            const recording =
+                recordings[index];
+
+            // Resume support.
+            //
+            // available:
+            //   We already successfully retrieved lyrics.
+            //
+            // unavailable:
+            //   Spotify metadata explicitly says this recording
+            //   does not have lyrics.
+            //
+            // pending is intentionally NOT skipped so a future
+            // enrichment run can retry it.
+            if (
+                recording.lyricsStatus === "available" ||
+                recording.lyricsStatus === "unavailable"
+            ) {
+                skipped++;
+                completed++;
+
+                console.log(
+                    `[${index + 1}/${recordings.length}] ↷ ${recording.trackName} — lyrics already processed`
+                );
+
+                continue;
+            }
+
+            try {
+                // Spotify explicitly says this recording
+                // does not have lyrics.
                 if (
-                    recording.lyricsStatus === "available" ||
-                    recording.lyricsStatus === "unavailable"
+                    recording.metadata?.hasLyrics !== true
                 ) {
-                    skipped++;
-                    completed++;
-
-                    console.log(
-                        `[${index + 1}/${recordings.length}] ↷ ${recording.trackName} — lyrics already processed`
-                    );
-
-                    continue;
-                }
-
-                try {
-                    if (
-                        recording.metadata?.hasLyrics !== true
-                    ) {
-                        recording.lyrics =
-                            null;
-
-                        recording.lyricsStatus =
-                            "unavailable";
-
-                        delete recording.lyricsError;
-
-                        unavailable++;
-
-                        console.log(
-                            `[${index + 1}/${recordings.length}] ○ ${recording.trackName} — no lyrics`
-                        );
-                    } else {
-                        const rawLyrics =
-                            await getTrackLyrics(
-                                recording.spotifyUri,
-                                recording.album?.imageUri
-                            );
-
-                        const normalizedLyrics =
-                            normalizeLyrics(
-                                rawLyrics
-                            );
-
-                        if (normalizedLyrics) {
-                            recording.lyrics =
-                                normalizedLyrics;
-
-                            recording.lyricsStatus =
-                                "available";
-
-                            delete recording.lyricsError;
-
-                            succeeded++;
-
-                            console.log(
-                                `[${index + 1}/${recordings.length}] ✓ ${recording.trackName}`
-                            );
-                        } else {
-                            recording.lyrics =
-                                null;
-
-                            recording.lyricsStatus =
-                                "unavailable";
-
-                            delete recording.lyricsError;
-
-                            unavailable++;
-
-                            console.log(
-                                `[${index + 1}/${recordings.length}] ○ ${recording.trackName} — empty lyrics response`
-                            );
-                        }
-                    }
-                } catch (error) {
                     recording.lyrics =
                         null;
 
                     recording.lyricsStatus =
-                        "error";
+                        "unavailable";
 
-                    recording.lyricsError = {
-                        message:
-                            error?.message ??
-                            String(error)
-                    };
+                    delete recording.lyricsError;
 
-                    failed++;
+                    unavailable++;
 
-                    console.error(
-                        `[${index + 1}/${recordings.length}] ✗ ${recording.trackName}`,
-                        error
+                    console.log(
+                        `[${index + 1}/${recordings.length}] ○ ${recording.trackName} — no lyrics`
                     );
-                }
+                } else {
+                    // Spotify metadata says lyrics exist.
+                    // Attempt to retrieve them.
+                    const rawLyrics =
+                        await getTrackLyrics(
+                            recording.spotifyUri,
+                            recording.album?.imageUri
+                        );
 
-                completed++;
+                    const normalizedLyrics =
+                        normalizeLyrics(
+                            rawLyrics
+                        );
 
-                if (
-                    delayMs > 0 &&
-                    index < recordings.length - 1
-                ) {
-                    await sleep(delayMs);
+                    if (normalizedLyrics) {
+                        recording.lyrics =
+                            normalizedLyrics;
+
+                        recording.lyricsStatus =
+                            "available";
+
+                        delete recording.lyricsError;
+
+                        succeeded++;
+
+                        console.log(
+                            `[${index + 1}/${recordings.length}] ✓ ${recording.trackName}`
+                        );
+                    } else {
+                        // Spotify says lyrics exist, but the
+                        // endpoint did not provide usable lyrics.
+                        //
+                        // Treat this as pending rather than
+                        // unavailable/error because Spotify may
+                        // still be preparing the lyrics.
+                        recording.lyrics =
+                            null;
+
+                        recording.lyricsStatus =
+                            "pending";
+
+                        recording.lyricsError = {
+                            message:
+                                "Spotify metadata reports lyrics, but the lyrics endpoint returned no usable lyrics."
+                        };
+
+                        pending++;
+
+                        console.warn(
+                            `[${index + 1}/${recordings.length}] ◌ ${recording.trackName} — lyrics pending`
+                        );
+                    }
                 }
+            } catch (error) {
+                // A thrown request error is a technical failure.
+                //
+                // Do NOT infer "pending" merely because Spotify metadata
+                // reports hasLyrics=true. The request may have failed due
+                // to rate limiting, networking, server errors, etc.
+                //
+                // "pending" is reserved for cases where the request itself
+                // succeeds but Spotify does not return usable lyrics.
+
+                recording.lyrics =
+                    null;
+
+                recording.lyricsStatus =
+                    "error";
+
+                recording.lyricsError = {
+                    message:
+                        error?.message ||
+                        String(error) ||
+                        "Lyrics request failed."
+                };
+
+                failed++;
+
+                console.error(
+                    `[${index + 1}/${recordings.length}] ✗ ${recording.trackName} — lyrics request failed`,
+                    error
+                );
+            }
+
+            completed++;
+
+            if (
+                delayMs > 0 &&
+                index < recordings.length - 1
+            ) {
+                await sleep(delayMs);
             }
         }
-
-        const workerCount =
-            Math.min(
-                Math.max(
-                    1,
-                    concurrency
-                ),
-                recordings.length || 1
-            );
-
-        await Promise.all(
-            Array.from(
-                {
-                    length:
-                        workerCount
-                },
-                () => worker()
-            )
-        );
-
-        console.log(
-            "Lyrics enrichment complete."
-        );
-
-        console.log({
-            completed,
-            succeeded,
-            unavailable,
-            failed,
-            skipped
-        });
-
-        return source;
     }
+
+    const workerCount =
+        Math.min(
+            Math.max(
+                1,
+                concurrency
+            ),
+            recordings.length || 1
+        );
+
+    await Promise.all(
+        Array.from(
+            {
+                length:
+                    workerCount
+            },
+            () => worker()
+        )
+    );
+
+    console.log(
+        "Lyrics enrichment complete."
+    );
+
+    console.log({
+        completed,
+        succeeded,
+        unavailable,
+        pending,
+        failed,
+        skipped
+    });
+
+    return source;
+}
 
 
     // ============================================================
@@ -1146,11 +1181,12 @@ globalThis.TriviaAdmin = (() => {
                 uniqueRecordings: 0,
                 uniqueArtists: 0,
 
-                lyrics: {
-                    available: 0,
-                    unavailable: 0,
-                    error: 0
-                },
+            lyrics: {
+                available: 0,
+                unavailable: 0,
+                pending: 0,
+                error: 0
+            },
 
                 artistBiographies: {
                     available: 0,
@@ -1458,6 +1494,13 @@ globalThis.TriviaAdmin = (() => {
                     "unavailable"
             ).length;
 
+        target.stats.lyrics.pending =
+            values.filter(
+                recording =>
+                    recording.lyrics.status ===
+                    "pending"
+            ).length;
+
         target.stats.lyrics.error =
             values.filter(
                 recording =>
@@ -1712,6 +1755,13 @@ globalThis.TriviaAdmin = (() => {
                     recording =>
                         recording.lyrics?.status ===
                         "unavailable"
+                ).length,
+
+            lyricsPending:
+                recordings.filter(
+                    recording =>
+                        recording.lyrics?.status ===
+                        "pending"
                 ).length,
 
             biographyAvailable:
