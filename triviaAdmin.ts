@@ -1,6 +1,6 @@
 // ============================================================
 // SYHO MUSIC TRIVIA
-// TriviaAdmin - Milestones 1-6
+// TriviaAdmin - Milestone 8 — Biography Fact Extraction / Input Budgeting
 //
 // FULL PLAYLIST TEST:
 //
@@ -27,7 +27,7 @@
 //   biography request initially failed
 //   retry succeeded.
 //
-// Known-working Milestones 1-6 baseline.
+// Known-working Milestones 1-7 baseline; Milestone 8 adds biography fact extraction.
 // ============================================================
 
 globalThis.TriviaAdmin = (() => {
@@ -53,7 +53,10 @@ globalThis.TriviaAdmin = (() => {
         artistDelayMs: 1000,
 
         candidateCount: 5,
-        playbackDurationMs: 30000
+        playbackDurationMs: 30000,
+
+        biographyChunkChars: 5000,
+        biographyFactsPerChunk: 6
     };
 
     const QUESTION_TYPES = [
@@ -1551,7 +1554,14 @@ globalThis.TriviaAdmin = (() => {
 
                     text:
                         artist.artistOverview?.biography ??
-                        null
+                        null,
+
+                    triviaFacts:
+                        Array.isArray(
+                            artist.biographyTriviaFacts
+                        )
+                            ? artist.biographyTriviaFacts
+                            : []
                 }
             };
         }
@@ -1869,11 +1879,14 @@ globalThis.TriviaAdmin = (() => {
                             name:
                                 recordingArtist.name,
 
-                            biography:
+                            biographyFacts:
                                 artist?.biography?.status ===
-                                "available"
-                                    ? artist.biography.text
-                                    : null
+                                "available" &&
+                                Array.isArray(
+                                    artist.biography.triviaFacts
+                                )
+                                    ? artist.biography.triviaFacts
+                                    : []
                         };
                     }
                 );
@@ -2001,8 +2014,10 @@ ${SOURCE_FACT_TYPES.join(", ")}
 
 9. For artist biography questions:
    - sourceFact.type must be "artist_biography"
-   - sourceFact.value must contain the exact supporting biography text
+   - use only the supplied biographyFacts for that artist
+   - sourceFact.value must be the EXACT sourceText from one supplied biographyFact
    - sourceFact.artistUri must identify the artist
+   - the compact fact field may help you understand the sourceText, but sourceFact.value must quote sourceText, not the compact fact
 
 QUESTION QUALITY RULES:
 
@@ -2357,6 +2372,395 @@ ${JSON.stringify(generationRequest.source)}`;
         throw new Error(
             "Could not locate generated text in Worker response."
         );
+    }
+
+
+    // ============================================================
+    // MILESTONE 8 — BIOGRAPHY FACT EXTRACTION
+    // ============================================================
+
+    function splitBiographyIntoChunks(
+        biography,
+        maxChars = DEFAULT_CONFIG.biographyChunkChars
+    ) {
+        const text =
+            String(
+                biography ?? ""
+            ).trim();
+
+        if (!text) {
+            return [];
+        }
+
+        const paragraphs =
+            text
+                .split(/\n\s*\n+/)
+                .map(item => item.trim())
+                .filter(Boolean);
+
+        const units = [];
+
+        for (const paragraph of paragraphs) {
+            if (paragraph.length <= maxChars) {
+                units.push(paragraph);
+                continue;
+            }
+
+            const sentences =
+                paragraph
+                    .match(/[^.!?]+(?:[.!?]+["')\]]*|$)/g)
+                    ?.map(item => item.trim())
+                    .filter(Boolean) ??
+                [paragraph];
+
+            for (const sentence of sentences) {
+                if (sentence.length <= maxChars) {
+                    units.push(sentence);
+                    continue;
+                }
+
+                // Last-resort protection for an unusually long sentence.
+                // Prefer whitespace boundaries so words are not split.
+                let remaining = sentence;
+
+                while (remaining.length > maxChars) {
+                    let splitAt =
+                        remaining.lastIndexOf(
+                            " ",
+                            maxChars
+                        );
+
+                    if (splitAt <= 0) {
+                        splitAt = maxChars;
+                    }
+
+                    units.push(
+                        remaining
+                            .slice(0, splitAt)
+                            .trim()
+                    );
+
+                    remaining =
+                        remaining
+                            .slice(splitAt)
+                            .trim();
+                }
+
+                if (remaining) {
+                    units.push(remaining);
+                }
+            }
+        }
+
+        const chunks = [];
+        let current = "";
+
+        for (const unit of units) {
+            const combined =
+                current
+                    ? `${current}\n\n${unit}`
+                    : unit;
+
+            if (
+                current &&
+                combined.length > maxChars
+            ) {
+                chunks.push(current);
+                current = unit;
+            } else {
+                current = combined;
+            }
+        }
+
+        if (current) {
+            chunks.push(current);
+        }
+
+        return chunks;
+    }
+
+
+    function buildBiographyFactPrompt(
+        artist,
+        chunk,
+        chunkIndex,
+        chunkCount,
+        factsPerChunk = DEFAULT_CONFIG.biographyFactsPerChunk
+    ) {
+        return `You are extracting grounded source facts for a live music trivia system.
+
+ARTIST:
+${artist.name}
+
+This is biography chunk ${chunkIndex + 1} of ${chunkCount}.
+
+Extract UP TO ${factsPerChunk} trivia-worthy facts from ONLY the supplied biography chunk.
+Quality is more important than quantity.
+
+RULES:
+1. Do not use outside knowledge.
+2. Prefer memorable facts useful for a social music trivia game: career events, achievements, collaborations, notable works, milestones, names, places, dates, numbers, or unusual details.
+3. Avoid vague opinions, promotional language, and facts that are not independently understandable.
+4. Each item must contain:
+   - fact: a concise statement of the fact.
+   - sourceText: an EXACT VERBATIM substring copied from BIOGRAPHY CHUNK that directly supports the fact.
+5. Do not paraphrase sourceText.
+6. Do not combine claims that require separate passages.
+7. Return ONLY a valid JSON array.
+
+OUTPUT SHAPE:
+[
+  {
+    "fact": "concise trivia fact",
+    "sourceText": "exact supporting text from the chunk"
+  }
+]
+
+BIOGRAPHY CHUNK:
+${chunk}`;
+    }
+
+
+    function normalizeBiographyFacts(
+        rawFacts,
+        fullBiography
+    ) {
+        if (!Array.isArray(rawFacts)) {
+            return [];
+        }
+
+        const facts = [];
+        const seen = new Set();
+
+        for (const raw of rawFacts) {
+            const fact =
+                typeof raw?.fact === "string"
+                    ? raw.fact.trim()
+                    : "";
+
+            const sourceText =
+                typeof raw?.sourceText === "string"
+                    ? raw.sourceText.trim()
+                    : "";
+
+            if (
+                !fact ||
+                !sourceText ||
+                !fullBiography.includes(sourceText)
+            ) {
+                continue;
+            }
+
+            const dedupeKey =
+                `${fact.toLowerCase()}\n${sourceText}`;
+
+            if (seen.has(dedupeKey)) {
+                continue;
+            }
+
+            seen.add(dedupeKey);
+
+            facts.push({
+                fact,
+                sourceText
+            });
+        }
+
+        return facts;
+    }
+
+
+    async function extractArtistBiographyFacts(
+        artistUri,
+        options = {}
+    ) {
+        const schema =
+            requireSchema();
+
+        const artist =
+            schema.artists?.[artistUri];
+
+        if (!artist) {
+            throw new Error(
+                `Artist not found: ${artistUri}`
+            );
+        }
+
+        const biography =
+            artist.biography?.text;
+
+        if (
+            artist.biography?.status !== "available" ||
+            typeof biography !== "string" ||
+            !biography.trim()
+        ) {
+            throw new Error(
+                `Artist biography is not available: ${artist.name ?? artistUri}`
+            );
+        }
+
+        const workerUrl =
+            options.workerUrl ??
+            DEFAULT_CONFIG.workerUrl;
+
+        const maxChars =
+            options.biographyChunkChars ??
+            DEFAULT_CONFIG.biographyChunkChars;
+
+        const factsPerChunk =
+            options.biographyFactsPerChunk ??
+            DEFAULT_CONFIG.biographyFactsPerChunk;
+
+        const force =
+            options.force === true;
+
+        if (
+            !force &&
+            Array.isArray(
+                artist.biography.triviaFacts
+            ) &&
+            artist.biography.triviaFacts.length
+        ) {
+            console.log(
+                `${artist.name} — using ${artist.biography.triviaFacts.length} cached biography trivia fact(s).`
+            );
+
+            return artist.biography.triviaFacts;
+        }
+
+        const chunks =
+            splitBiographyIntoChunks(
+                biography,
+                maxChars
+            );
+
+        console.log(
+            `${artist.name} — extracting biography facts from ${chunks.length} chunk(s).`
+        );
+
+        const collected = [];
+
+        for (
+            let index = 0;
+            index < chunks.length;
+            index++
+        ) {
+            const prompt =
+                buildBiographyFactPrompt(
+                    artist,
+                    chunks[index],
+                    index,
+                    chunks.length,
+                    factsPerChunk
+                );
+
+            console.log(
+                `[${index + 1}/${chunks.length}] Biography extraction prompt: ${prompt.length.toLocaleString()} characters`
+            );
+
+            if (prompt.length > 20000) {
+                throw new Error(
+                    `Biography extraction prompt exceeds 20,000 characters for ${artist.name}.`
+                );
+            }
+
+            const workerResponse =
+                await callQuestionWorker(
+                    prompt,
+                    workerUrl
+                );
+
+            const generatedText =
+                extractWorkerGeneratedText(
+                    workerResponse
+                );
+
+            const rawFacts =
+                parseCandidateArray(
+                    generatedText
+                );
+
+            const groundedFacts =
+                normalizeBiographyFacts(
+                    rawFacts,
+                    biography
+                );
+
+            console.log(
+                `[${index + 1}/${chunks.length}] ${groundedFacts.length}/${rawFacts.length} grounded fact(s) accepted.`
+            );
+
+            collected.push(
+                ...groundedFacts
+            );
+        }
+
+        const facts =
+            normalizeBiographyFacts(
+                collected,
+                biography
+            );
+
+        artist.biography.triviaFacts =
+            facts;
+
+        const workingArtist =
+            state.workingSource?.artists?.[artistUri];
+
+        if (workingArtist) {
+            workingArtist.biographyTriviaFacts =
+                facts;
+        }
+
+        console.log(
+            `${artist.name} — cached ${facts.length} grounded biography trivia fact(s).`
+        );
+
+        return facts;
+    }
+
+
+    async function prepareBiographyFactsForRecording(
+        recordingKey,
+        options = {}
+    ) {
+        const recording =
+            getRecording(
+                recordingKey
+            );
+
+        const results = [];
+
+        for (const artist of recording.artists ?? []) {
+            const schemaArtist =
+                requireSchema().artists?.[
+                    artist.spotifyUri
+                ];
+
+            if (
+                schemaArtist?.biography?.status !==
+                "available"
+            ) {
+                continue;
+            }
+
+            const facts =
+                await extractArtistBiographyFacts(
+                    artist.spotifyUri,
+                    options
+                );
+
+            results.push({
+                spotifyUri:
+                    artist.spotifyUri,
+                name:
+                    artist.name,
+                factCount:
+                    facts.length
+            });
+        }
+
+        return results;
     }
 
 
@@ -3317,14 +3721,36 @@ ${JSON.stringify(generationRequest.source)}`;
                                 "UNKNOWN_BIOGRAPHY_ARTIST",
                                 `sourceFact.artistUri is not present in generation source: ${sourceFact.artistUri}`
                             );
-                        } else if (
-                            typeof artist.biography !== "string" ||
-                            !artist.biography.includes(value)
-                        ) {
-                            addError(
-                                "UNGROUNDED_ARTIST_BIOGRAPHY",
-                                "sourceFact.value is not an exact substring of the supplied artist biography."
-                            );
+                        } else {
+                            const authoritativeBiography =
+                                state.schema?.artists?.[
+                                    sourceFact.artistUri
+                                ]?.biography?.text;
+
+                            const suppliedFactMatch =
+                                (artist.biographyFacts ?? [])
+                                    .some(
+                                        fact =>
+                                            fact?.sourceText ===
+                                            value
+                                    );
+
+                            const authoritativeMatch =
+                                typeof authoritativeBiography ===
+                                "string" &&
+                                authoritativeBiography.includes(
+                                    value
+                                );
+
+                            if (
+                                !suppliedFactMatch ||
+                                !authoritativeMatch
+                            ) {
+                                addError(
+                                    "UNGROUNDED_ARTIST_BIOGRAPHY",
+                                    "sourceFact.value must exactly match a supplied biography fact sourceText and occur in the full authoritative biography."
+                                );
+                            }
                         }
                     }
                 }
@@ -3447,6 +3873,13 @@ ${JSON.stringify(generationRequest.source)}`;
                 DEFAULT_CONFIG.workerUrl
         } = {}
     ) {
+        await prepareBiographyFactsForRecording(
+            recordingKey,
+            {
+                workerUrl
+            }
+        );
+
         const source =
             buildGenerationInput(
                 recordingKey
@@ -3558,7 +3991,7 @@ ${JSON.stringify(generationRequest.source)}`;
 
     const api = {
         version:
-            "milestone-7-candidate-validation",
+            "milestone-8-biography-fact-extraction",
 
         config:
             DEFAULT_CONFIG,
@@ -3586,6 +4019,10 @@ ${JSON.stringify(generationRequest.source)}`;
 
         buildGenerationPrompt,
 
+        extractArtistBiographyFacts,
+
+        prepareBiographyFactsForRecording,
+
         generateQuestions,
 
         validateCandidate,
@@ -3600,6 +4037,9 @@ ${JSON.stringify(generationRequest.source)}`;
             getTrackLyrics,
             normalizeLyrics,
             normalizeArtistOverview,
+            splitBiographyIntoChunks,
+            buildBiographyFactPrompt,
+            normalizeBiographyFacts,
             validateTriviaV2,
             downloadTriviaJSON
         }

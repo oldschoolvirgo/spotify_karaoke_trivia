@@ -58,7 +58,16 @@ export default {
     }
     try {
       const result = await env.AI.run(MODEL, {
-        messages: [{ role: "user", content: prompt.trim() }],
+        messages: [
+          {
+            role: "system",
+            content: "Reasoning: low. Generate the requested JSON directly. Do not spend tokens planning or explaining your choices.",
+          },
+          {
+            role: "user",
+            content: prompt.trim(),
+          },
+        ],
         max_tokens: 4000,
       }) as {
         choices?: Array<{ message?: { content?: string | null } | null }> | null;
